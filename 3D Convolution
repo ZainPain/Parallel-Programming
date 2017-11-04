@@ -1,0 +1,175 @@
+#include <wb.h>
+
+#define wbCheck(stmt)                                                     \
+  do {                                                                    \
+    cudaError_t err = stmt;                                               \
+    if (err != cudaSuccess) {                                             \
+      wbLog(ERROR, "CUDA error: ", cudaGetErrorString(err));              \
+      wbLog(ERROR, "Failed to run stmt ", #stmt);                         \
+      return -1;                                                          \
+    }                                                                     \
+  } while (0)
+
+//@@ Define any useful program-wide constants here
+#define MASK_WIDTH 3
+#define MASK_RADIUS 1
+#define TILE_WIDTH 2
+//@@ Define constant memory for device kernel here
+__constant__ float maskCache[MASK_WIDTH][MASK_WIDTH][MASK_WIDTH];
+
+__global__ void conv3d(float *input, float *output, const int z_size,
+                       const int y_size, const int x_size) {
+  //@@ Insert kernel code here
+  int tx,ty,tz,bx,by,bz;
+  __shared__ float sharedInput[TILE_WIDTH+MASK_WIDTH-1][TILE_WIDTH+MASK_WIDTH-1][TILE_WIDTH+MASK_WIDTH-1];
+  //int i = blockIdx.x * blockDim.x +threadIdx.x;
+  int row_o,col_o, pitch_o;
+  int row_i,col_i, pitch_i;
+  int z_in,y_in,x_in;
+  float Ocalc = 0.0;
+  
+  tx = threadIdx.x;
+  ty = threadIdx.y;
+  tz = threadIdx.z;
+  bx = blockIdx.x;
+  by = blockIdx.y;
+  bz = blockIdx.z;
+  // these elements are
+  row_o = by * TILE_WIDTH + ty;//row_o = blockIdx.y * TILE_WIDTH + ty;
+  col_o = bx * TILE_WIDTH + tx;//col_o = blockIdx.x * TILE_WIDTH + tx;
+  pitch_o = bz * TILE_WIDTH + tz;//pitch_o = blockIdx.z * TILE_WIDTH + tz;
+  
+  row_i = row_o - (MASK_RADIUS);
+  col_i = col_o - (MASK_RADIUS);
+  pitch_i = pitch_o - (MASK_RADIUS);
+  
+ if((row_i >= 0) && (row_i < y_size) && 
+    (col_i >= 0) && (col_i < x_size) && 
+    (pitch_i >= 0) && (pitch_i < z_size))
+ {
+   // z * (y_size * x_size) + y * (x_size) + x
+   sharedInput[tz][ty][tx] = input[pitch_i * (y_size * x_size) + row_i * (x_size) + col_i];
+ }   
+ else
+   sharedInput[tz][ty][tx] = 0.0;
+ __syncthreads();
+ if(ty < TILE_WIDTH && tx < TILE_WIDTH && tz < TILE_WIDTH)
+ {
+   for(int i = 0; i < MASK_WIDTH; i++)
+   {
+     for(int j = 0; j < MASK_WIDTH; j++)
+     {
+       for(int k = 0; k < MASK_WIDTH; k++)
+       {
+         //output += sharedInput[i][j][k] * maskCache[][][];
+         z_in = tz + i;
+         y_in = ty + j;
+         x_in = tx + k;
+         if((z_in >= 0) && (z_in < z_size) &&
+            (y_in >= 0) && (y_in < y_size) &&
+            (x_in >= 0) && (x_in < x_size))
+         {
+           Ocalc += sharedInput[z_in][y_in][x_in] * maskCache[i][j][k];
+         }
+       }
+     }
+   }
+   //__syncthreads();
+   if((row_o < y_size) && (col_o < x_size) && (pitch_o < z_size))
+   {
+     output[pitch_o * (y_size * x_size) + row_o * (x_size) + col_o] = Ocalc;
+   }
+ }
+}
+int main(int argc, char *argv[]) {
+  wbArg_t args;
+  int z_size;
+  int y_size;
+  int x_size;
+  int inputLength, kernelLength;
+  float *hostInput;
+  float *hostKernel;
+  float *hostOutput;
+  float *deviceInput;
+  float *deviceOutput;
+
+  args = wbArg_read(argc, argv);
+
+  // Import data
+  hostInput = (float *)wbImport(wbArg_getInputFile(args, 0), &inputLength);
+  hostKernel =
+      (float *)wbImport(wbArg_getInputFile(args, 1), &kernelLength);
+  hostOutput = (float *)malloc(inputLength * sizeof(float));
+
+  // First three elements are the input dimensions
+  z_size = hostInput[0];
+  y_size = hostInput[1];
+  x_size = hostInput[2];
+  wbLog(TRACE, "The input size is ", z_size, "x", y_size, "x", x_size);
+  assert(z_size * y_size * x_size == inputLength - 3);
+  assert(kernelLength == 27);
+  
+  wbTime_start(GPU, "Doing GPU Computation (memory + compute)");
+
+  wbTime_start(GPU, "Doing GPU memory allocation");
+  //@@ Allocate GPU memory here
+  // Recall that inputLength is 3 elements longer than the input data
+  // because the first  three elements were the dimensions
+  int d_inputLength = inputLength - 3;
+  wbCheck(cudaMalloc((void **) &deviceInput, d_inputLength * sizeof(float)));
+  wbCheck(cudaMalloc((void **) &deviceOutput, d_inputLength * sizeof(float)));
+  wbTime_stop(GPU, "Doing GPU memory allocation");
+
+  wbTime_start(Copy, "Copying data to the GPU");
+  //@@ Copy input and kernel to GPU here
+  // Recall that the first three elements of hostInput are dimensions and
+  // do not need to be copied to the gpu
+  
+  wbCheck(cudaMemcpy(deviceInput,&hostInput[3],d_inputLength*sizeof(float),cudaMemcpyHostToDevice));
+  wbCheck(cudaMemcpyToSymbol(maskCache,hostKernel, kernelLength*sizeof(float)));
+  wbTime_stop(Copy, "Copying data to the GPU");
+
+  wbTime_start(Compute, "Doing the computation on the GPU");
+  //@@ Initialize grid and block dimensions here
+  
+  int BLOCK_WIDTH = TILE_WIDTH + MASK_WIDTH -1;
+  int xgrid = (x_size - 1 )/(1.0 * TILE_WIDTH) + 1;
+  int ygrid = (y_size - 1 )/(1.0 * TILE_WIDTH) + 1;
+  int zgrid = (z_size - 1 )/(1.0 * TILE_WIDTH) + 1;
+  
+  dim3 dimBlock(BLOCK_WIDTH,BLOCK_WIDTH,BLOCK_WIDTH);
+  dim3 dimGrid(xgrid,ygrid,zgrid);
+  //@@ Launch the GPU kernel here
+  conv3d<<<dimGrid,dimBlock>>>(deviceInput, deviceOutput, z_size,
+                       y_size,x_size);
+  
+  wbCheck(cudaDeviceSynchronize());
+  wbTime_stop(Compute, "Doing the computation on the GPU");
+
+  wbTime_start(Copy, "Copying data from the GPU");
+  //@@ Copy the device memory back to the host here
+  // Recall that the first three elements of the output are the dimensions
+  // and should not be set here (they are set below)
+  
+  wbCheck(cudaMemcpy(&hostOutput[3],deviceOutput,d_inputLength*sizeof(float),cudaMemcpyDeviceToHost));
+
+    
+  wbTime_stop(Copy, "Copying data from the GPU");
+
+  wbTime_stop(GPU, "Doing GPU Computation (memory + compute)");
+
+  // Set the output dimensions for correctness checking
+  hostOutput[0] = z_size;
+  hostOutput[1] = y_size;
+  hostOutput[2] = x_size;
+  wbSolution(args, hostOutput, inputLength);
+
+  // Free device memory
+  cudaFree(deviceInput);
+  cudaFree(deviceOutput);
+
+  // Free host memory
+  free(hostInput);
+  free(hostOutput);
+  return 0;
+}
