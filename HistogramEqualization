@@ -1,0 +1,263 @@
+// Histogram Equalization
+
+#include <wb.h>
+
+#define wbCheck(stmt)                                                     \
+  do {                                                                    \
+    cudaError_t err = stmt;                                               \
+    if (err != cudaSuccess) {                                             \
+      wbLog(ERROR, "Failed to run stmt ", #stmt);                         \
+      wbLog(ERROR, "Got CUDA error ...  ", cudaGetErrorString(err));      \
+      return -1;                                                          \
+    }                                                                     \
+  } while (0)
+
+#define BLOCK_SIZE 256
+#define HISTOGRAM_LENGTH 256
+#define SECTION_SIZE 512
+typedef unsigned char uchar;
+typedef unsigned int uint;
+//@@ insert code here
+
+/* Cast the image from float to unsigned char */
+__global__ void castToChar(float * input, uchar * output, int size)
+{
+  int i = threadIdx.x + blockDim.x * blockIdx.x;
+  // make sure  valid i
+  if(i < size)
+    output[i] = (unsigned char) (255 * input[i]);
+  
+}
+
+/* Cast back to float */
+__global__ void castToFloat(uchar * input, float * output, int size)
+{
+  int i = threadIdx.x + blockDim.x * blockIdx.x;
+  if(i < size)
+    output[i] = (float) ((input[i]*1.0) / 255.0);
+}
+
+/* Convert the image from RGB to GrayScale */
+__global__ void rgbToGrayscale(uchar * input, uchar * output, int size)
+{
+  
+  int i = threadIdx.x +blockIdx.x*blockDim.x;
+  float r;
+  float g;
+  float b;
+  if( i < size)
+  {
+    r = (float) input[3 * i];
+    g = (float) input[3 * i + 1];
+    b = (float) input[3 * i + 2];
+    output[i] = (uchar) (.21*r + .71*g + .07 * b);
+  }
+}
+/* Compute the histogram of grayImage */
+__global__ void histo_kernel(uchar * buffer, uint * histogram,int size )
+{
+  __shared__ uint private_histogram[BLOCK_SIZE];
+  
+  /* initializing shared memory to 0 */
+  if(threadIdx.x < 256)
+    private_histogram[threadIdx.x] = 0;
+  __syncthreads();
+  
+  int i = threadIdx.x + blockDim.x * blockIdx.x;
+  
+  // stread is the total number of threads
+  int stride = blockDim.x * gridDim.x;
+  
+  /* atomic add operation */
+  while(i < size )
+  {
+    atomicAdd(&histogram[buffer[i]], 1);
+    i+= stride;
+  }
+  __syncthreads();
+  
+  if(threadIdx.x < HISTOGRAM_LENGTH)
+    atomicAdd(&(histogram[threadIdx.x]), private_histogram[threadIdx.x]);
+  
+  
+}
+/* Compute the Cumulative Distribution Function of histogram 
+   Compute the minimum value of the CDF. The maximal value of the CDF should be 1.0.
+*/
+__global__ void scanCDF(float * cdf, uint *histogram, int width, int height)
+{
+  __shared__ float XY[SECTION_SIZE];
+  int i = threadIdx.x + blockDim.x * blockIdx.x;
+  uint stride;
+  uint index;
+  
+  /* p() calculates the probability of a pixel to be in a histogram bin */
+  if(i < SECTION_SIZE && i < HISTOGRAM_LENGTH)
+    XY[i] = (float) (histogram[i] * 1.0 / (width*height * 1.0));
+  
+  __syncthreads();
+  
+  /* reduction step */
+  for(stride = 1; stride <= BLOCK_SIZE; stride *= 2)
+  {
+    index = (threadIdx.x + 1) * stride * 2 - 1;
+    if(index < SECTION_SIZE && index  < HISTOGRAM_LENGTH)
+      XY[index] += XY[index - stride];
+     __syncthreads();
+  }
+  
+  /* post-reduction step */
+  for(stride = BLOCK_SIZE / 2; stride >= 1; stride /= 2)
+  {
+    __syncthreads();
+    index = (threadIdx.x + 1) * stride * 2 - 1;
+    if(index + stride < SECTION_SIZE && index + stride < HISTOGRAM_LENGTH)
+      XY[index + stride] += XY[index];
+    
+  }
+  __syncthreads();
+  if(i < SECTION_SIZE && i < HISTOGRAM_LENGTH)
+    cdf[i] += XY[threadIdx.x];
+}
+
+/* Define the histogram equalization function */
+
+__global__ void equalizor(float * cdf, uchar * image, int size)
+{
+  int i = threadIdx.x +blockIdx.x * blockDim.x;
+  float cdfmin = cdf[0];
+  float x, start,end;
+  
+  if (i < size)
+  {
+    x = 255.0 * (cdf[image[i]] - cdfmin) / (1.0 - cdfmin);
+    start = 0;
+    end = 255.0;
+    if(x > start && x < end)
+      image[i] = x;
+    else if(x < start)
+      image[i] = start;
+    else
+    {
+      if(x > end)
+      image[i] = end;
+    }
+  }
+}
+
+/*
+Apply the histogram equalization function
+*/
+
+int main(int argc, char **argv) {
+  wbArg_t args;
+  int imageWidth;
+  int imageHeight;
+  int imageChannels;
+  int WHC;
+  int WH;
+  wbImage_t inputImage;
+  wbImage_t outputImage;
+  float *hostInputImageData;
+  float *hostOutputImageData;
+  const char *inputImageFile;
+  
+  //@@ Insert more code here
+  
+  uchar * floatToChar_arr;
+  uchar * grayScale;
+  uint * histogram;
+  float * cdf;
+  
+  // device arrays
+  float *deviceInputImageData;
+  float *deviceOutputImageData;
+  
+  args = wbArg_read(argc, argv); /* parse the input arguments */
+
+  inputImageFile = wbArg_getInputFile(args, 0);
+
+  wbTime_start(Generic, "Importing data and creating memory on host");
+  inputImage = wbImport(inputImageFile);
+  imageWidth = wbImage_getWidth(inputImage);
+  imageHeight = wbImage_getHeight(inputImage);
+  imageChannels = wbImage_getChannels(inputImage);
+  WHC = imageWidth * imageHeight * imageChannels;
+  WH = imageWidth * imageHeight;
+  outputImage = wbImage_new(imageWidth, imageHeight, imageChannels);
+  wbTime_stop(Generic, "Importing data and creating memory on host");
+
+  /*https://github.com/abduld/libwb/blob/master/wbImage.h */
+  //@@ insert code here
+  /***********************************************************/
+  hostInputImageData = wbImage_getData(inputImage);
+  hostOutputImageData = wbImage_getData(outputImage);
+  /* basically this will take wbImage_t object as input and access data field
+    which is a pointer so hostInput/output will be writing there
+  */
+  
+ 
+  wbTime_start(GPU, "Allocating GPU Memory");
+  
+  /* Allocating space for device input/output arrays */
+  wbCheck(cudaMalloc( (void **) &deviceInputImageData, WHC * sizeof(float)));
+  wbCheck(cudaMalloc( (void **) &deviceOutputImageData, WHC * sizeof(float)));
+  
+  wbCheck(cudaMalloc( (void **) &floatToChar_arr, WHC * sizeof(uchar)));
+  wbCheck(cudaMalloc( (void **) &grayScale, WH * sizeof(float)));
+  wbCheck(cudaMalloc( (void **) &histogram, HISTOGRAM_LENGTH * sizeof(uint)));
+  wbCheck(cudaMalloc( (void **) &cdf, HISTOGRAM_LENGTH * sizeof(uint) ));
+  
+  wbTime_stop(GPU, "Allocating GPU Memory");
+  
+  wbTime_start(GPU, "Copy Data to GPU");
+  
+  wbCheck(cudaMemcpy(deviceInputImageData,hostInputImageData,WHC*sizeof(float),cudaMemcpyHostToDevice));  
+  /* Initialize cdf and histogram array with 0's */
+  wbCheck(cudaMemset(histogram,0,HISTOGRAM_LENGTH * sizeof(uint)));
+  wbCheck(cudaMemset(cdf, 0, HISTOGRAM_LENGTH * sizeof(float)));
+  
+  wbTime_stop(GPU, "Copy Data to GPU");
+  
+  
+  
+  int numOfBlock = (WHC-1)/BLOCK_SIZE + 1;
+  int histoBlock = (WHC-1)/HISTOGRAM_LENGTH + 1;
+  
+  dim3 dimBlock(BLOCK_SIZE);
+  dim3 dimGrid(numOfBlock);
+  dim3 dimGrid2(histoBlock);
+  
+  wbTime_start(Compute, "Kernel Code");
+  
+  castToChar<<<dimGrid,dimBlock>>>(deviceInputImageData,floatToChar_arr,WHC);
+  rgbToGrayscale<<<dimGrid,dimBlock>>>(floatToChar_arr,grayScale, WH);
+  histo_kernel<<<dimGrid,dimBlock>>>(grayScale,histogram,WH);
+  scanCDF<<<dimGrid2,dimBlock>>>(cdf, histogram, imageWidth,imageHeight);
+  equalizor<<<dimGrid,dimBlock>>>(cdf,floatToChar_arr,WHC);
+  castToFloat<<<dimGrid,dimBlock>>>(floatToChar_arr, deviceOutputImageData, WHC);
+  
+  wbTime_stop(Compute, "Kernel Code");
+  
+/*  
+  for(int i = 0; i < WHC;i++)
+  {
+    wbLog(TRACE,"floatToChar[",i,"]",floatToChar_arr[i]);
+  }
+  
+*/
+  wbCheck(cudaMemcpy(hostOutputImageData,deviceOutputImageData,WHC*sizeof(float),cudaMemcpyDeviceToHost));
+  wbImage_setData(outputImage,hostOutputImageData);
+  /***********************************************************/
+  wbSolution(args, outputImage);
+  
+  wbCheck(cudaFree(cdf));
+  wbCheck(cudaFree(floatToChar_arr));
+  wbCheck(cudaFree(grayScale));
+  wbCheck(cudaFree(histogram));
+  wbCheck(cudaFree(deviceInputImageData));
+  wbCheck(cudaFree(deviceOutputImageData));
+  //@@ insert code here
+
+  return 0;
+}
